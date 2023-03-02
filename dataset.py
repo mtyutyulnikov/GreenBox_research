@@ -11,10 +11,16 @@ torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
 
-from preproccesing import get_test_transforms, get_train_transforms
+from preproccesing import (
+    get_test_transforms,
+    get_train_top_transforms,
+    get_train_side_transforms,
+)
 import pandas as pd
 import random
 import math
+from torchvision.transforms import Grayscale
+import numpy as np
 
 
 def choose_labels(all_files, label_list):
@@ -30,15 +36,22 @@ class GarbageDataset(Dataset):
         labels_set,
         side_transform=None,
         top_transform=None,
-        metal_randomize = False,
-        weight_randomize =False,
-        weight_divider_coef = 1,
-        metal_divider_coef = 1,
-        class_to_int_dict = {'plastic' : 0, 'alum' : 1, 'glass' : 2, 'other' : 3}
+        metal_randomize=False,
+        weight_randomize=False,
+        weight_divider_coef=1000,
+        metal_divider_coef=300,
+        class_to_int_dict={"plastic": 0, "alum": 1, "glass": 2, "other": 3},
+        background_image_path="background.jpg",
+        allow_ood_shift=False,
     ):
         self.dataset_info = pd.read_csv(dataset_info_file_path)
-        self.dataset_info['weight'] /= weight_divider_coef
-        self.dataset_info['metal_median'] /= metal_divider_coef
+        self.dataset_info["weight"] /= weight_divider_coef
+        self.dataset_info["metal_median"] /= metal_divider_coef
+
+        self.dataset_info["weight"] = self.dataset_info["weight"].astype(np.float32)
+        self.dataset_info["metal_median"] = self.dataset_info["metal_median"].astype(
+            np.float32
+        )
 
         self.side_photos = choose_labels(
             sorted(list(data_dir.glob("*_side.png"))), labels_set
@@ -53,11 +66,17 @@ class GarbageDataset(Dataset):
         self.weight_randomize = weight_randomize
         self.weight_divider_coef = weight_divider_coef
         self.metal_divider_coef = metal_divider_coef
-
         self.class_to_int_dict = class_to_int_dict
 
+        self.background_image = cv2.cvtColor(
+            cv2.imread(background_image_path), cv2.COLOR_BGR2RGB
+        )
+        self.background_image = cv2.resize(self.background_image, (640, 360))
+        self.background_image = self.top_transform(image=self.background_image)["image"]
 
         assert len(self.side_photos) == len(self.top_photos)
+        self.to_grayscale = Grayscale()
+        self.allow_ood_shift = allow_ood_shift
 
     def __len__(self):
         return len(self.top_photos)
@@ -66,13 +85,17 @@ class GarbageDataset(Dataset):
         top_photo = self.top_photos[index]
         side_photo = self.side_photos[index]
 
-        top_img = cv2.imread(str(top_photo))
-        side_img = cv2.imread(str(side_photo))
+        top_img = cv2.cvtColor(cv2.imread(str(top_photo)), cv2.COLOR_BGR2RGB)
+        side_img = cv2.cvtColor(cv2.imread(str(side_photo)), cv2.COLOR_BGR2RGB)
 
         if self.top_transform is not None:
-            top_img = self.top_transform(image=top_img)
+            top_img = self.top_transform(image=top_img)["image"]
+
         if self.side_transform is not None:
-            side_img = self.side_transform(image=side_img)
+            side_img = self.side_transform(image=side_img)["image"]
+
+        top_delta_mask = abs(top_img - self.background_image) ** 2
+        top_delta_mask = top_delta_mask.mean(0).unsqueeze(0)
 
         df = self.dataset_info
         row = df[
@@ -81,23 +104,49 @@ class GarbageDataset(Dataset):
         ]
         row = row.iloc[0]
         metal_median = row["metal_median"]
-        weight = row["weight"] 
+        weight = row["weight"]
         bottle_class = row["class"]
-        
-        if self.weight_randomize:
-            if random.random() < 0.15:
-                weight = random.normalvariate(2*weight, weight) 
-        
-        if self.metal_randomize:
-            if random.random() < 0.35:
-                if bottle_class == 'alum':
-                    metal_median = random.normalvariate(100, 50) / self.metal_divider_coef
-                else:
-                    metal_median += random.normalvariate(0, 30) / self.metal_divider_coef
 
+        if self.weight_randomize:
+            if self.allow_ood_shift:  # Бутылка с жидкостью
+                if bottle_class == "plastic" and random.random() < 0.10:
+                    weight = random.uniform(100, 500) / self.weight_divider_coef
+                    bottle_class = "other"
+                elif bottle_class == "alum" and random.random() < 0.05:
+                    weight = random.uniform(100, 200) / self.weight_divider_coef
+                    bottle_class = "other"
+
+            if random.random() < 0.2:  # Шум
+                weight += random.normalvariate(0, weight / 6) / self.weight_divider_coef
+
+            weight = max(0, weight)
+
+        if self.metal_randomize:
+            if bottle_class == "alum":
+                if random.random() < 0.10:  # Не полностью сработал датчик
+                    metal_median = (
+                        random.normalvariate(100, 50) / self.metal_divider_coef
+                    )
+                elif random.random() < 0.05:  # Не сработал датчик
+                    metal_median = (
+                        random.normalvariate(270, 40) / self.metal_divider_coef
+                    )
+
+            else:  # Шум
+                metal_median += random.normalvariate(0, 3) / self.metal_divider_coef
+            metal_median = max(metal_median, 0)
 
         y = self.class_to_int_dict[bottle_class]
-        return top_img, side_img, metal_median, weight, y, index
+
+        x = {
+            "top_img": top_img,
+            "side_img": side_img,
+            "top_delta_mask": top_delta_mask,
+            "metal": np.float32(metal_median),
+            "weight": np.float32(weight),
+        }
+
+        return x, y, index
 
 
 class GarbageDataModule(LightningDataModule):
@@ -121,16 +170,16 @@ class GarbageDataModule(LightningDataModule):
         test_path = self.data_dir / "test"
         csv_path = self.data_dir / "full_dataset_info.csv"
 
-        # ----define dataset-----#
         if stage == "fit" or stage is None:
             self.train_dataset = GarbageDataset(
                 train_path,
                 csv_path,
                 labels_set=self.labels_set["train_labels"],
-                side_transform=get_train_transforms(),
-                top_transform=get_train_transforms(),
-                metal_randomize = True,
-                weight_randomize =True,
+                side_transform=get_train_side_transforms(),
+                top_transform=get_train_top_transforms(),
+                metal_randomize=True,
+                weight_randomize=True,
+                allow_ood_shift=True,
             )
             self.train_dataset_no_augs_indom = GarbageDataset(
                 train_path,
@@ -143,8 +192,9 @@ class GarbageDataModule(LightningDataModule):
                 train_path,
                 csv_path,
                 labels_set=self.labels_set["train_labels_indom"],
-                side_transform=get_train_transforms(),
-                top_transform=get_train_transforms(),
+                side_transform=get_train_side_transforms(),
+                top_transform=get_train_top_transforms(),
+                allow_ood_shift=False,
             )
             self.val_dataset = GarbageDataset(
                 val_path,
@@ -152,6 +202,7 @@ class GarbageDataModule(LightningDataModule):
                 labels_set=self.labels_set["val_labels"],
                 side_transform=get_test_transforms(),
                 top_transform=get_test_transforms(),
+                allow_ood_shift=True,
             )
             self.val_dataset_in_domain = GarbageDataset(
                 val_path,
@@ -159,6 +210,25 @@ class GarbageDataModule(LightningDataModule):
                 labels_set=self.labels_set["val_labels_indom"],
                 side_transform=get_test_transforms(),
                 top_transform=get_test_transforms(),
+                allow_ood_shift=False,
+            )
+            self.val_dataset_ood = GarbageDataset(
+                val_path,
+                csv_path,
+                labels_set=self.labels_set["val_labels"],
+                side_transform=get_test_transforms(),
+                top_transform=get_test_transforms(),
+                class_to_int_dict={"plastic": 0, "alum": 1, "glass": 2, "other": -1},
+                allow_ood_shift=True,
+            )
+            self.train_dataset_binary = GarbageDataset(
+                train_path,
+                csv_path,
+                labels_set=self.labels_set["train_labels"],
+                side_transform=get_train_side_transforms(),
+                top_transform=get_train_top_transforms(),
+                class_to_int_dict={"plastic": 0, "alum": 0, "glass": 0, "other": 1},
+                allow_ood_shift=True,
             )
             self.val_dataset_binary = GarbageDataset(
                 val_path,
@@ -166,9 +236,9 @@ class GarbageDataModule(LightningDataModule):
                 labels_set=self.labels_set["val_labels"],
                 side_transform=get_test_transforms(),
                 top_transform=get_test_transforms(),
-                class_to_int_dict = {'plastic' : 0, 'alum' : 0, 'glass' : 0, 'other' : -1}
+                class_to_int_dict={"plastic": 0, "alum": 0, "glass": 0, "other": 1},
+                allow_ood_shift=True,
             )
-
 
         self.test_dataset = GarbageDataset(
             test_path,
@@ -177,56 +247,69 @@ class GarbageDataModule(LightningDataModule):
             side_transform=get_test_transforms(),
             top_transform=get_test_transforms(),
         )
-        self.test_dataset_no_transforms = GarbageDataset(
-            test_path,
-            csv_path,
-            labels_set=self.labels_set["test_labels"],
-        )
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def train_dataloader_indom(self):
         return DataLoader(
-            self.train_dataset_indom, batch_size=self.batch_size, num_workers=self.num_workers
+            self.train_dataset_indom,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
+
     def train_dataloader_no_augs_indom(self):
         return DataLoader(
-            self.train_dataset_no_augs_indom, batch_size=self.batch_size, num_workers=self.num_workers
+            self.train_dataset_no_augs_indom,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
-
-    # def val_dataloader(self):
-    #     return self.val_dataloader_indom()
 
     def val_dataloader_indom(self):
         return DataLoader(
             self.val_dataset_in_domain,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-        )
-    def val_dataloader_binary(self):
-        return DataLoader(
-            self.val_dataset_binary,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
+            shuffle=True,
         )
 
+    def val_dataloader_ood(self):
+        return DataLoader(
+            self.val_dataset_ood,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+        )
 
     def test_dataloader(self):
         return DataLoader(
-            self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+            self.test_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def predict_dataloader(self):
         return DataLoader(
-            self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+            self.test_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def aluminium_test_dataloader(self):
@@ -234,6 +317,7 @@ class GarbageDataModule(LightningDataModule):
             self.test_aluminium_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def others_dataloader(self):
@@ -241,4 +325,21 @@ class GarbageDataModule(LightningDataModule):
             self.test_others_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            shuffle=True,
         )
+
+    def train_dataloader_binary(self) :
+        return DataLoader(
+            self.train_dataset_binary,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+        )
+    def val_dataloader_binary(self) :
+        return DataLoader(
+            self.val_dataset_binary,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+        )
+
